@@ -1,0 +1,457 @@
+#!/usr/bin/python
+
+"""
+autoripd
+(c) 2011 Tim Babb
+
+Monitor optical disk drives, then use handbrake/makemkvcon to rip video discs
+when they are inserted.
+"""
+
+import os, sys
+import stat
+import pwd
+import grp
+import json
+import daemonizer
+import ripdisc
+import discmonitor
+import signal
+import common_util
+import imp
+import shutil
+
+from procmgmt import ProcessManager
+from common_util import Error, Warn, Msg, Babble, Die
+
+
+# TODO: abstract settings to a class with attributes, i.e. like a struct
+#       with built in documentation and implicit detectable types
+# TODO: construct each plugin with the settings built-in, so we don't have
+#       to keep keying a !@#$% dictionary
+# TODO: allow settings to be set from the cmd line
+# TODO: failure to read from /dev/sr0 is a permissions error due to issetuid()?
+# TODO: stacktrace in dvd property parsing
+
+# SOMEDAY: plugins to handle failed rips
+
+# SETUP:
+#   - make an autoripd user, group
+#   - add autoripd user to group cdrom
+#   - make /etc/autoripd/ and place autoripd.conf there
+#   - set permissions on /etc/autoripd/{,autoripd.conf}
+#   - make /opt/autoripd and place all the program files there
+#   - set permissions there too
+#   - put a policyKit file in 
+#       /etc/polkit-1/localauthority/50-local.d/20-autoripd.pkla (?)
+#   - make a link in /usr/bin to /opt/autoripd/autoripd
+#   - place an init script in /etc/init.d
+
+
+########################
+# Settings             #
+########################
+
+
+DEFAULT_SETTINGS = dict(
+          monitorDevices = ['/dev/sr0'],
+                 destDir = '/home/media/movies/',
+              tempRipDir = '/home/media/movies/', 
+                    user = 'jack',
+                   group = 'media',
+                   umask = 0o0002,    # permissions: rwxrwxr-x
+                 logfile = '/var/log/autoripd/autoripd.log',
+          daemon_timeout = 3,
+               m2tsRemux = True,
+               ejectDisc = True,
+        handbrakeOptions = ['--main-feature',
+                            '--large-file',
+                            '-e', 'x264',
+                            '-S', '2600', # desired size in MB
+                           # '-q', '17',  # lower num is better quality.
+                            '-N', 'eng'], # native lang = english
+         leaveBrokenRips = True,
+                 verbose = False,
+           enablePlugins = ["remuxer"])
+
+DEFAULT_CONFIG_LOC = '/etc/autoripd/autoripd.conf'
+
+
+########################
+# Exceptions           #
+########################
+
+
+class InvalidSettingKey(Exception):
+    pass
+
+class ConfigException(Exception):
+    
+    def __init__(self, msg, err=None):
+        if err is not None:
+            msg = "%s (%s)" % (msg, err)
+        Exception.__init__(self, msg)
+        self.orig_error = err
+
+
+########################
+# Configuration class  #
+########################
+
+
+# TODO: someday enforce types
+class AutoripSettings:
+    """Class which manages loading of config settings from disk and/or supplied 
+    dictionaries. Can return a properly-configured AutoripDaemon object."""
+    
+    def __init__(self, 
+                 settings_loc=DEFAULT_CONFIG_LOC,
+                 extra_settings=None):
+        self.load_config(settings_loc)
+        if extra_settings is not None:
+            self.merge_settings(extra_settings)
+    
+    
+    def load_config(self, settings_loc=DEFAULT_CONFIG_LOC):
+        """Load the given config from disk."""
+        if os.path.isfile(settings_loc):
+            try:
+                with open(settings_loc, 'r') as f:
+                    new_settings = json.load(f)
+                    
+                    # plugins must be loaded immediately 
+                    # to obtain their default settings
+                    self._load_plugins(new_settings)
+                    
+                    s = self.combine_settings_dicts(self.get_defaults(), 
+                                                    new_settings,
+                                                    self.get_defaults())
+            except IOError, err:
+                e = ConfigException("Could not read config file '%s'" % \
+                                    settings_loc, err)
+                raise e
+            except ValueError, err:
+                e = ConfigException("Error parsing config file '%s'" % \
+                                    settings_loc, err)
+                raise e
+        else:
+            print >>sys.stderr, "No config found; using default settings"
+            s = dict(DEFAULT_SETTINGS)
+            self._load_plugins(s)
+        
+        if 'verbose' in s:
+            common_util.verbose = s['verbose']
+        
+        self._settings = s
+    
+    
+    def _load_plugins(self, settings):
+        if 'enablePlugins' in settings:
+            pnames = settings['enablePlugins']
+        else:
+            pnames = DEFAULT_SETTINGS['enablePlugins']
+        plugins = []
+        
+        # __file__ may not be set on this module if we are running 
+        # interactively. ask a different module:
+        instpath = os.path.dirname(ripdisc.__file__)
+        
+        for pname in pnames:
+            ploc = os.path.join(instpath, "plugin", "%s.py" % pname)
+            try:
+                p_module = imp.load_source(pname, ploc)
+            except Exception, e:
+                Error("Failed to load plugin '%s' from %s: %s" % (pname, ploc, e))
+                raise
+            
+            if hasattr(p_module, 'GetPluginClass'):
+                plugins.append(p_module)
+            else:
+                raise NotImplementedError("Plugin '%s' has no "
+                            "'GetPluginInstance' function" % pname)
+        self._plugins = plugins
+        self._defaults = self._compute_defaults(plugins)
+    
+    
+    @staticmethod
+    def _compute_defaults(pluginModules):
+        """Compute the default config settings. Each plugin may define its own 
+        settings and defaults."""
+        s = dict(DEFAULT_SETTINGS)
+        for p in pluginModules:
+            p_cls = p.GetPluginClass()
+            if hasattr(p_cls, 'getDefaultSettings'):
+                pluginsettings = p_cls.getDefaultSettings()
+                for skey in pluginsettings:
+                    if skey in s:
+                        Warn("Setting '%s' in plugin '%s' exists in another "
+                             "plugin or in the program defaults. The new "
+                             "default will be ignored." % (ns, p.__name__))
+                    else:
+                        s[skey] = pluginsettings[skey]
+        return s
+    
+    
+    def __getitem__(self, setting):
+        return self.get(setting)
+    
+    def __setitem__(self, setting, val):
+        if setting not in DEFAULT_SETTINGS:
+            raise InvalidSettingKey("Unrecognized setting %s" % setting)
+        else:
+            self._settings[setting] = val
+    
+    def __contains__(self, item):
+        return item in self._settings
+    
+    def __iter__(self):
+        return self._settings.__iter__()
+    
+    
+    def get(self, setting):
+        if setting in self._settings:
+            return self._settings[setting]
+        elif setting in DEFAULT_SETTINGS:
+            raise ConfigException("No config value for '%s'" % setting)
+        else:
+            raise InvalidSettingKey("Unrecognized setting: %s" % setting)
+    
+    
+    @staticmethod
+    def combine_settings_dicts(old_settings, 
+                               new_settings, 
+                               defaults=DEFAULT_SETTINGS):
+        """Merge two settings dictionaries."""
+        s = dict(old_settings)
+        for k in new_settings.iterkeys():
+            if k not in defaults:
+                Warn("Unrecognized setting: %s" % k)
+        s.update(new_settings)
+        return s
+    
+    
+    def get_plugin_modules(self):
+        return self._plugins
+    
+    
+    def get_defaults(self):
+        return self._defaults
+    
+    
+    def get_all_settings(self):
+        return dict(self._settings)
+    
+    
+    def merge_settings(self, new_settings):
+        """Merge the given settings dictionary onto this config object."""
+        self._settings = self.combine_settings_dicts(
+                                 self._settings, 
+                                 new_settings,
+                                 self.get_defaults())
+    
+    
+    def create_daemon(self):
+        user, group = self.get('user'), self.get('group')
+    
+        # resolve userid, groupid
+        try:
+            uid = pwd.getpwnam(user).pw_uid
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError, e:
+            Die("Invalid user or group: u=%s, g=%s" % (user,group)) 
+        
+        dmn = AutoripDaemon(
+                 daemon_name='autoripd',
+                 pid_timeout=self.get('daemon_timeout'),
+                 working_dir=self.get('destDir'),
+                 umask=self.get('umask'),
+                 uid=uid,
+                 gid=gid,
+                 prevent_core=True,
+                 stdout=self.get('logfile'),
+                 stderr=self.get('logfile'),
+                 settings=self)
+        
+        return dmn
+
+
+########################
+# Ripper daemon object #
+########################
+
+
+class AutoripDaemon(daemonizer.DaemonController):
+    
+    def __init__(self, settings=None, *daemon_args, **daemon_kwargs):
+        """Create a new AutoripDaemon controller object.
+        Accepts all the same arguments that a DaemonController does, plus
+        an AutoripSettings object.
+        """
+        daemonizer.DaemonController.__init__(self, *daemon_args, **daemon_kwargs) 
+        if settings is None:
+            self.settings = AutoripSettings()
+        else:
+            self.settings = settings
+        self._processManager = ProcessManager()
+    
+    
+    def run(self):
+        if 'HOME' in os.environ:
+            del os.environ['HOME']
+        devices = self.settings['monitorDevices']
+        discmonitor.monitorDevices(devices, self)
+    
+    
+    def on_terminate(self):
+        ok = True
+        pm = self._processManager 
+        pm.lockProcessStart()
+        children = pm.getActivePIDs()
+        for pid in children: 
+            try:
+                Msg("Killing child process %s" % pid)
+                os.kill(pid, signal.SIGTERM)
+            except Exception, e:
+                ok = False
+                Warn("Unable to terminate child process (%s)" % str(e))
+        
+        Msg("Terminated.")
+        
+        # return exitcode
+        return 0 if ok else 1 
+    
+    
+    def ripBluRay(self, device, discID):
+        # error handling is sufficiently robust since each rip operation
+        # happens in its own thread. If any errors are thrown, that thread
+        # will terminate, but the other threads will continue and the daemon
+        # will survive unharmed.
+        s = self.settings
+        discID = 'UNKNOWN_BLURAY' if discID is None else discID
+        wdir = self.createWorkingDir(discID)
+        try:
+            newfile = ripdisc.ripBluRay(device, 
+                              s['destDir'],
+                              wdir,
+                              s['ejectDisc'],
+                              self._processManager)
+            if newfile is None:
+                Error("Extraction of %s failed" % discID)
+                if not s['leaveBrokenRips']:
+                    shutil.rmtree(wdir)
+            else:
+                self.runPlugins(newfile, wdir)
+                Msg('Rip complete.')
+                shutil.rmtree(wdir)
+        except:
+            if not s['leaveBrokenRips']:
+                shutil.rmtree(wdir)
+            Error('Rip of %s failed' % discID)
+            raise
+    
+    
+    def ripDVD(self, device, discID):
+        discID = 'UNKNOWN_DVD' if discID is None else discID
+        wdir = self.createWorkingDir(discID)
+        try:
+            s = self.settings 
+            newfile = ripdisc.ripDVD(device,
+                           s['destDir'],
+                           wdir,
+                           s['handbrakeOptions'], 
+                           s['ejectDisc'],
+                           self._processManager)
+            if newfile is None:
+                Error("Extraction of %s failed" % discID)
+                if not s['leaveBrokenRips']:
+                    shutil.rmtree(wdir)
+            else:
+                self.runPlugins(newfile, wdir)
+                Msg('Rip complete.')
+                shutil.rmtree(wdir)
+        except:
+            if not s['leaveBrokenRips']:
+                shutil.rmtree(wdir)
+            Error('Rip of %s failed' % discID)
+            raise
+    
+    
+    def runPlugins(self, newfile, wdir):
+        p_output = []
+        all_settings = self.settings.get_all_settings()
+        mediadata = ripdisc.mediaInfoData(newfile, self._processManager)
+        
+        for p in self.settings.get_plugin_modules():
+            Msg("Running plugin '%s' on %s" % (p.__name__, newfile))
+            p_cls    = p.GetPluginClass()
+            p_instnc = p_cls(self._processManager)
+            dat = p_instnc.processRip(
+                      newfile, 
+                      mediadata, 
+                      all_settings,
+                      wdir,
+                      p_output)
+            p_output.append(dat)
+            Msg("'%s' completed." % p.__name__)
+    
+    
+    def createWorkingDir(self, discID):
+        s = self.settings
+        userTmpDir  = s['tempRipDir']
+        tmp_parent  = s['destDir'] if userTmpDir is None else userTmpDir
+        desired_tmp = os.path.join(tmp_parent, "tmp.%s.ripdir" % discID)
+        finalTmpDir = common_util.uniquePath(desired_tmp)
+        os.makedirs(finalTmpDir)
+        return finalTmpDir
+
+
+########################
+# Entry point          #
+########################
+
+
+def startAutoripDaemon(settings_loc, daemoncmd=None):
+    try:
+        settings = AutoripSettings(settings_loc)
+        controller = settings.create_daemon()
+        if daemoncmd is not None:
+            # execute daemon command
+            ok, msg = controller.do_command(*daemoncmd)
+            print msg
+            return ok
+        else:
+            # running in --nodaemon mode. just start monitoring.
+            controller.run()
+            return 0
+    except Exception, err:
+        raise
+        print >>sys.stderr, err.__str__()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    usage = "%prog [options] {start|stop|restart}"
+    import optparse
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option("--nodaemon", dest="nodaemon", action="store_true",
+                      default=False, help="do not detach process and run as a "
+                      "daemon; instead run directly in the terminal. In this "
+                      "mode, all daemon-related settings (such as user, group, " 
+                      "umask, and logfile) will be ignored.")
+    parser.add_option("--config", dest="config", action="store",
+                      default=DEFAULT_CONFIG_LOC, help="load the daemon "
+                      "configuration from the given file (default: %default)")
+    
+    opts, args = parser.parse_args()
+    
+    if not opts.nodaemon: 
+        ok = startAutoripDaemon(opts.config, args)
+    elif len(args) > 0:
+        print >>sys.stderr, "Cannot execute daemon control commands in --nodaemon mode"
+        parser.print_help()
+        sys.exit(1)
+    else:
+        # start in "nodaemon" mode
+        ok = startAutoripDaemon(opts.config, None)
+    
+    sys.exit(0 if ok else 1)

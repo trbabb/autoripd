@@ -1,0 +1,51 @@
+#!/usr/bin/python
+
+import imp
+import ripdisc
+import procmgmt
+import sys
+import common_util
+import json
+import shutil
+
+def ComputeSettings(autoripd, plugin_name):
+    settings = autoripd.AutoripSettings()
+    jsonfile = open(autoripd.DEFAULT_CONFIG_LOC, 'r')
+    jsondict = new_settings = json.load(jsonfile)
+    # override the on-disk plugin settings, but keep everything else the same
+    jsondict['enablePlugins'] = [plugin_name]
+    settings._load_plugins(jsondict)
+    settings._settings = settings.combine_settings_dicts(settings.get_defaults(), 
+                                          jsondict,
+                                          settings.get_defaults())
+    return settings
+
+
+def TestPlugin(plugin_name, f): 
+    common_util.verbose = True
+    autoripd = imp.load_source('autoripd','autoripd')
+    settings = ComputeSettings(autoripd, plugin_name)
+    daemon   = settings.create_daemon()
+    wdir     = daemon.createWorkingDir('plugin_test')
+    
+    try:
+        daemon.runPlugins(f, wdir)
+        shutil.rmtree(wdir)
+    except:
+        if not settings['leaveBrokenRips']:
+            shutil.rmtree(wdir)
+        raise
+
+
+if __name__ == "__main__":
+    
+    if len(sys.argv) < 3:
+        print """Usage: testPlugin PLUGIN FILE
+        
+        Test-run an autoripd plugin on a media file.
+        """
+        sys.exit(1)
+    
+    plugin_name, f = sys.argv[1:3]
+    
+    TestPlugin(plugin_name, f)

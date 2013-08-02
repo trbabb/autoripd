@@ -1,0 +1,80 @@
+autoripd
+(c) 2011-2012 Tim Babb
+Version 1.0
+
+Monitor optical disk drives, then use handbrake/makemkvcon to rip video discs
+when they are inserted.
+
+To start as a daemon, run:
+
+   sudo /etc/init.d/autoripd start
+
+Requirements:
+  - unix/linux
+  - udev
+  - udisks
+  - makemkvcon
+  - HandBrakeCLI
+  - mediainfo (if using plugins)
+
+Features:
+  - easily configurable
+  - blu-ray and dvd main feature detection
+  - names your files with the full movie title
+  - plugin architecture for easily processing files after ripping
+  - runs as a well-behaved daemon process
+    - can run with reduced privileges (as a specified user) for increased safety
+    - protection against running multiple instances
+    - configurable file creation permissions 
+    - follows standard daemon conventions/commands
+    - can run at startup
+    - won't leave zombie processes when killed normally
+    - well behaved logging
+  - robust error handling:
+    - a rip failure will not stop the daemon
+    - partially complete rips can optionally be saved for debugging/recovery
+
+Important default file locations:
+  Logfile:
+     /var/log/autoripd/autoripd.log
+  Configuration file:
+     /etc/autoripd/autoripd.conf
+
+Configuration settings:
+   monitorDevices (list(string)): 
+       Device(s) to monitor for disc insertion events. E.g. ["/dev/sr0"]
+   destDir (string):
+       Path of folder where the finished ripped video files will be placed
+   tempRipDir (string):
+       Path of folder where in-progress rips will go. Each job will get a unique 
+       folder in this location. If `None`, then temporary directories will be 
+       placed in `destDir`. It is a good idea for this folder to be on the same 
+       filesystem as `destDir` to prevent excessive copying.
+   logfile (string):
+       Path of file in which to log messages and errors.
+   ejectDisc (bool):
+       Whether to eject the disc after ripping is finished.
+   leaveBrokenRips (bool):
+       Whether to delete or save partially written video files when a rip fails.
+   verbose (bool):
+       When set, outputs extra detailed debug information, including the 
+       standard output of subprocesses like HandBrake and makemkvcon.
+   enablePlugins (list(string)):
+       List of names of plugins to enable. Each plugin will be loaded from the 
+       plugins directory, then run in order on each rip result. 
+       E.g. ["example", "remuxer"]
+   user (string):
+       Run the daemon as this user. It is recommended that a dedicated user with 
+       non-root privileges and access to 'cdrom' be created for maximum security 
+       and safety.
+   group (string):
+       Run the daemon as a member of this usergroup. User and group privileges 
+       should be as restrictive as possible while still allowing the daemon to 
+       perform its duties.
+   umask (int):
+       File mode creation mask of the daemon. This determines how the 
+       permissions will be set on the ripped movie files. For universal access, 
+       use umask 000.
+   daemon_timeout (number):
+       Seconds to wait for the daemon to start or stop before declaring an 
+       error.
